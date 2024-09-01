@@ -57,7 +57,6 @@ function importCSVToSQLite(csvData, db, tableName) {
     });
 }
 
-// Function to convert KQL queries to SQL
 function convertKqlToSql(kqlQuery) {
     const commands = kqlQuery.split('|').map(cmd => cmd.trim());
     let sqlQuery = '';

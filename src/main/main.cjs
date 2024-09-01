@@ -1,7 +1,10 @@
+// main.cjs
+
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
-const sqlite3 = require('sqlite3').verbose();  // Ensure sqlite3 is imported
-const { readCSVFile, importCSVToSQLite, executeSQL } = require('./csv-handler');
+const sqlite3 = require('sqlite3').verbose();
+const { readCSVFile, importCSVToSQLite } = require('./csv-handler');
+const { convertKqlToSql } = require('./kql-to-sql');
 
 let db;  // In-memory SQLite database
 
@@ -58,16 +61,40 @@ ipcMain.handle('select-csv-files', async () => {
 });
 
 // Handle query execution
-ipcMain.handle('execute-query', async (event, sqlQuery) => {
+ipcMain.handle('execute-query', async (event, query) => {
     if (!db) {
         throw new Error('No database available. Please select CSV files first.');
     }
 
+    console.log('Original query:', query);
+
+    // Remove any default text or comments
+    query = query.replace(/^--.*$/gm, '').trim();
+
+    if (!query) {
+        console.error('Empty query after cleaning');
+        throw new Error('Empty query');
+    }
+
     try {
-        const result = await executeSQL(db, sqlQuery);
-        return result;
+        const sqlQuery = convertKqlToSql(query);
+        console.log('SQL query to be executed:', sqlQuery);
+
+        return new Promise((resolve, reject) => {
+            db.all(sqlQuery, [], (err, rows) => {
+                if (err) {
+                    console.error('Error executing SQL query:', err);
+                    reject(err);
+                } else {
+                    console.log('Query executed successfully, returned', rows.length, 'rows');
+                    resolve(rows);
+                }
+            });
+        });
     } catch (error) {
-        console.error('Error executing query:', error);
-        return { error: 'Failed to execute query' };
+        console.error('Error during query execution:', error);
+        throw error;
     }
 });
+
+module.exports = { createWindow };

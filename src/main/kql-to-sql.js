@@ -1,67 +1,185 @@
-function convertKqlToSql(kqlQuery) {
-    // Split the KQL query into individual commands based on the pipe operator
-    const commands = kqlQuery.split('|').map(cmd => cmd.trim());
+function convertKqlToSql(inputQuery) {
+    console.log('Original input query:', inputQuery);
 
-    let sqlQuery = '';
-    let currentTable = ''; // To track the current table being worked on
+    // Remove comments, placeholder text, and trim
+    let cleanedQuery = inputQuery
+        .replace(/--.*$/gm, '')  // Remove single-line comments
+        .replace(/\/\*[\s\S]*?\*\//gm, '')  // Remove multi-line comments
+        .replace(/^.*?Write your KQL query here.*?\n/m, '')  // Remove placeholder text
+        .trim();
 
-    commands.forEach((command, index) => {
-        if (command.match(/^select\b/i)) {
-            sqlQuery += command
-                .replace(/select\b/i, 'SELECT')
-                .replace(/\bfrom\b/i, 'FROM');
-            currentTable = command.match(/\bfrom\s+([^\s]+)/i)[1];
-        } else if (command.match(/^where\b/i)) {
-            sqlQuery += ' ' + command.replace(/where\b/i, 'WHERE');
-        } else if (command.match(/^join\b/i)) {
-            sqlQuery += ' ' + command
-                .replace(/\bjoin\b/i, 'JOIN')
-                .replace(/\bon\b/i, 'ON');
-        } else if (command.match(/^summarize\b/i)) {
-            sqlQuery += ' ' + command
-                .replace(/\bsummarize\b/i, 'GROUP BY')
-                .replace(/\bby\b/i, '');
-        } else if (command.match(/^order by\b/i)) {
-            sqlQuery += ' ' + command.replace(/order by\b/i, 'ORDER BY');
-        } else if (command.match(/^take\b/i)) {
-            sqlQuery += ' ' + command.replace(/take\b/i, 'LIMIT');
-        } else if (command.match(/^extend\b/i)) {
-            // Handle the extend operation by adding new fields to SELECT
-            sqlQuery = sqlQuery.replace('SELECT', 'SELECT '); // Ensure there's space
-            const extendPart = command.replace(/\bextend\b/i, '').trim();
-            sqlQuery = sqlQuery.replace(/SELECT(.*)FROM/i, `SELECT $1, ${extendPart} FROM`);
-        } else if (command.match(/^project\b/i)) {
-            if (index === 0) {
-                sqlQuery += command.replace(/\bproject\b/i, 'SELECT');
-                currentTable = command.match(/\bfrom\s+([^\s]+)/i)[1];
-            } else {
-                sqlQuery += ', ' + command.replace(/\bproject\b/i, '');
-            }
-        } else if (command.match(/^project-away\b/i)) {
-            // Implementing project-away by removing columns from SELECT
-            const columnsToRemove = command.replace(/\bproject-away\b/i, '').trim().split(/\s*,\s*/);
-            columnsToRemove.forEach(col => {
-                sqlQuery = sqlQuery.replace(new RegExp(`\\b${col}\\b,?`, 'gi'), '');
-            });
-        } else if (command.match(/^top\b/i)) {
-            const topMatch = command.match(/\btop\b\s+(\d+)\s+by\s+([^\s]+)/i);
-            if (topMatch) {
-                const topCount = topMatch[1];
-                const topColumn = topMatch[2];
-                sqlQuery += ` ORDER BY ${topColumn} DESC LIMIT ${topCount}`;
-            }
-        }
-    });
+    console.log('Cleaned query:', cleanedQuery);
 
-    // Ensure the final SQL query ends correctly
-    if (sqlQuery.trim().endsWith(',')) {
-        sqlQuery = sqlQuery.trim().slice(0, -1);
+    if (!cleanedQuery) {
+        throw new Error('Empty query after cleaning');
     }
 
-    // Handle the scenario where "GROUP BY" is followed by "ORDER BY"
-    sqlQuery = sqlQuery.replace(/\bGROUP BY\b\s*([^\s]+)\s*\bORDER BY\b/i, 'GROUP BY $1 ORDER BY');
+    let sqlQuery = '';
 
+    if (cleanedQuery.toLowerCase().startsWith('select')) {
+        // The query is already in SQL format
+        sqlQuery = cleanedQuery;
+    } else {
+        // Assume it's a KQL query and convert it
+        sqlQuery = convertKqlToSqlInternal(cleanedQuery);
+    }
+
+    // Final cleanup: remove any double quotes around table names
+    sqlQuery = sqlQuery.replace(/"([^"]+)"/g, '$1');
+
+    console.log('Final SQL query:', sqlQuery);
     return sqlQuery.trim();
 }
 
+function convertKqlToSqlInternal(kqlQuery) {
+    const commands = kqlQuery.split('|').map(cmd => cmd.trim());
+    console.log('Parsed commands:', commands);
+
+    let sqlQuery = '';
+    let tableName = '';
+    let whereClauses = [];
+    let limitClause = '';
+
+    commands.forEach((command, index) => {
+        console.log(`Processing command ${index}:`, command);
+        
+        if (index === 0) {
+            tableName = command;
+            sqlQuery = `SELECT * FROM ${tableName}`;
+        } else {
+            const lowerCmd = command.toLowerCase();
+            
+            if (lowerCmd.startsWith('where')) {
+                whereClauses.push(convertKqlWhereToSql(command.slice(5).trim()));
+            } else if (lowerCmd.startsWith('project')) {
+                sqlQuery = sqlQuery.replace('SELECT *', `SELECT ${command.slice(7).trim()}`);
+            } else if (lowerCmd.startsWith('summarize')) {
+                sqlQuery = convertKqlSummarizeToSql(sqlQuery, command.slice(9).trim());
+            } else if (lowerCmd.startsWith('limit')) {
+                limitClause = ` LIMIT ${command.split(/\s+/)[1]}`;
+            }
+            // Add other KQL command conversions as needed
+        }
+    });
+
+    // Combine all WHERE clauses
+    if (whereClauses.length > 0) {
+        sqlQuery += ` WHERE ${whereClauses.join(' AND ')}`;
+    }
+
+    // Add LIMIT clause if present
+    sqlQuery += limitClause;
+
+    return sqlQuery;
+}
+
+function convertKqlWhereToSql(whereClause) {
+    return whereClause
+        .replace(/([^=!<>])=/g, '$1 =')
+        .replace(/==/g, '=')
+        .replace(/!=/g, '<>')
+        .replace(/contains/gi, 'LIKE')
+        .replace(/LIKE\s*"([^"]*)"/, "LIKE '%$1%'")
+        .replace(/LIKE\s*'([^']*)'/, "LIKE '%$1%'");
+}
+
+function convertKqlSummarizeToSql(sqlQuery, summarizeClause) {
+    const parts = summarizeClause.split(/\s+by\s+/i);
+    const groupBy = parts[1] ? parts[1].split(',').map(col => col.trim()) : [];
+
+    if (groupBy.length > 0) {
+        let newSqlQuery = sqlQuery.replace('SELECT *', `SELECT ${groupBy.join(', ')}`);
+        newSqlQuery += ` GROUP BY ${groupBy.join(', ')}`;
+        return newSqlQuery;
+    }
+
+    return sqlQuery;
+}
+
 module.exports = { convertKqlToSql };
+
+
+// new file:
+
+
+// function convertKqlToSqlite(kqlQuery) {
+//     const commands = kqlQuery.split('|').map(cmd => cmd.trim());
+//     console.log('Parsed commands:', commands);
+
+//     let sqliteQuery = '';
+//     let tableName = '';
+//     let selectClauses = ['*'];
+//     let whereClauses = [];
+//     let groupByClauses = [];
+//     let orderByClauses = [];
+//     let limitClause = '';
+
+//     commands.forEach((command, index) => {
+//         console.log(`Processing command ${index}:`, command);
+        
+//         if (index === 0) {
+//             tableName = command;
+//         } else {
+//             const lowerCmd = command.toLowerCase();
+            
+//             if (lowerCmd.startsWith('where')) {
+//                 whereClauses.push(convertKqlWhereToSqlite(command.slice(5).trim()));
+//             } else if (lowerCmd.startsWith('project')) {
+//                 selectClauses = command.slice(7).split(',').map(col => col.trim());
+//             } else if (lowerCmd.startsWith('summarize')) {
+//                 const summarizeParts = command.slice(9).trim().split(/\s+by\s+/i);
+//                 const aggregations = summarizeParts[0].split(',').map(agg => agg.trim());
+                
+//                 aggregations.forEach(agg => {
+//                     const match = agg.match(/(\w+)\s*=\s*(\w+)\((.*?)\)/);
+//                     if (match) {
+//                         const [, alias, funcName, args] = match;
+//                         if (funcName.toLowerCase() === 'make_bag') {
+//                             selectClauses.push(`json_group_object(${args}) as ${alias}`);
+//                         } else {
+//                             selectClauses.push(`${funcName}(${args}) as ${alias}`);
+//                         }
+//                     }
+//                 });
+
+//                 if (summarizeParts[1]) {
+//                     groupByClauses = summarizeParts[1].split(',').map(col => col.trim());
+//                     selectClauses.push(...groupByClauses);
+//                 }
+//             } else if (lowerCmd.startsWith('order by')) {
+//                 orderByClauses = command.slice(8).split(',').map(col => col.trim());
+//             } else if (lowerCmd.startsWith('limit')) {
+//                 limitClause = ` LIMIT ${command.split(/\s+/)[1]}`;
+//             }
+//         }
+//     });
+
+//     sqliteQuery = `SELECT ${selectClauses.join(', ')} FROM ${tableName}`;
+
+//     if (whereClauses.length > 0) {
+//         sqliteQuery += ` WHERE ${whereClauses.join(' AND ')}`;
+//     }
+
+//     if (groupByClauses.length > 0) {
+//         sqliteQuery += ` GROUP BY ${groupByClauses.join(', ')}`;
+//     }
+
+//     if (orderByClauses.length > 0) {
+//         sqliteQuery += ` ORDER BY ${orderByClauses.join(', ')}`;
+//     }
+
+//     sqliteQuery += limitClause;
+
+//     console.log('Final SQLite query:', sqliteQuery);
+//     return sqliteQuery.trim();
+// }
+
+// function convertKqlWhereToSqlite(whereClause) {
+//     return whereClause
+//         .replace(/([^=!<>])=/g, '$1 =')
+//         .replace(/==/g, '=')
+//         .replace(/!=/g, '<>')
+//         .replace(/contains/gi, 'LIKE')
+//         .replace(/LIKE\s*"([^"]*)"/, "LIKE '%$1%'")
+//         .replace(/LIKE\s*'([^']*)'/, "LIKE '%$1%'");
+// }
